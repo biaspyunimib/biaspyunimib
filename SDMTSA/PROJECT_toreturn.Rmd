@@ -1,0 +1,991 @@
+---
+title: "Project Streaming Data Managment and Time Series Analysis"
+author: "Biagio Spiezia"
+date: "2024-11-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Librerie
+
+```{r}
+library(tidyverse)
+library(xts)
+library(tseries)
+library(urca)
+library(aTSA)
+library(TSA)
+library(prophet)
+library(KFAS)
+library(class)  
+library(caret)
+library(lubridate)
+library(forecast)
+```
+
+## Caricamento dei dati
+
+Importiamo i dati nel software, trasformiamo il nostro dataset in una time-series e dividiamo le nostre osservazioni in train set e test set (le osservazioni riguardanti l'ultimo mese della nostra serie storica che hanno come valore NA). Esploriamo graficamente la serie storica.
+
+```{r}
+data<-read_csv("ts2024.csv")
+data<-data[,c(1,4)]
+
+data<-xts(data$X,order.by = data$DateTime)
+
+
+# Divisione del dataset in train e test set 
+data_fine<-as.POSIXct("2016-12-01 00:00:00",tz="UTC")
+train_data<- data[index(data) < data_fine]
+test_data<- data[index(data) >= data_fine]
+plot(train_data)
+```
+
+## Modello ARIMA
+
+Trasformiamo la nostra serie storica in un oggetto di classe ts.
+
+```{r}
+train_data<-ts(train_data)
+```
+
+
+
+### Test per verificare la stazionarietà : ADF
+
+Utilizziamo il test di Dickey Fuller per verificare la stazionarietà nella nostra serie storica.
+
+```{r}
+ur.df(train_data,"none")|> urca::summary()
+```
+
+La statistica test del nostro Augmented Dickey-Fueller test è molto inferiore ai valori critici, dunque possiamo rifiutare l'ipotesi nulla che la serie storica non contenga una radice unitaria e quindi è stazionaria. Per questo non andremo a considerare alcune trasformazione dei dati o calcolare differenze.
+
+### ACF e PACF
+
+```{r}
+Acf(train_data, 24 ,main="Autocorrelation of 1 day")
+Acf(train_data, 24*7,main="Autocorrelation of 1 week")
+Acf(train_data, 24*30,main="Autocorrelation of 1 month")
+Acf(train_data,main="Autocorrelation")
+
+```
+
+```{r}
+Pacf(train_data, 24,main="Partial-Autocorrelation of 1 day")
+Pacf(train_data, 24*7,main="Partial-Autocorrelation of 1 week")
+Pacf(train_data, 24*30,main="Partial-Autocorrelation of 1 month")
+Pacf(train_data,main="Partial-Autocorrelation")
+```
+
+```{r}
+
+#Differenziazione giornaliera 
+
+lag_daily <- 24 
+diff_daily<- diff(train_data,lag = lag_daily)
+adf_daily<- ur.df(diff_daily, type = "none", selectlags = "AIC")
+summary(adf_daily)
+Acf(diff_daily,main="Acf daily part",24)
+Pacf(diff_daily,main="Pacf daily part",24)
+
+
+# Differenziazione settimanale
+lag_weekly <- 24 * 7
+diff_weekly <- diff(train_data,lag = lag_weekly)
+adf_weekly <- ur.df(diff_weekly, type = "none", selectlags = "AIC")
+summary(adf_weekly)
+Acf(diff_weekly,main="Acf weekly part",24)
+Pacf(diff_weekly,main="Pacf weekly part",24)
+
+# Differenziazione mensile
+lag_monthly <- 24 * 30
+diff_monthly <- diff(train_data, lag = lag_monthly)
+adf_monthly <- ur.df(diff_monthly, type = "none", selectlags = "AIC")
+summary(adf_monthly)
+Acf(diff_monthly,main="Acf monthly part",24)
+Pacf(diff_monthly,main="Pacf monthly part",24)
+
+```
+
+
+Tutti i test di Dickey-Fuller effettuati portano al rifiuto dell'ipotesi nulla, e quindi a considerare la nostra serie storica anche nella sua parte stagionale.
+
+### Divisione della serie in train and validation set.
+
+Dividiamo la nostra serie storica in train e validations set al fine di individuare il migliore modello. Dividiamo l'83% delle osservazioni nel train set (circa 580 giorni, 83 settimane, 20 mesi) e il 17% delle osservazioni nel validation set(circa 120 giorni,16 settimane ,4 mesi).
+
+```{r}
+set.seed(1800)
+n <- length(train_data)
+train_size <- n*0.83
+train_data_m <- ts(train_data[1:train_size])
+val_data_m <- ts(train_data[(train_size+1):n])
+```
+
+### Function auto.arima
+
+```{r}
+p <- 1:3
+q <- 0:1
+P <- 1:2
+Q <- 0:2
+model <- auto.arima(train_data_m,d=0,D=0,max.p = 3,max.q = 1,max.P = 1,max.Q = 2,
+                    start.p = 1,start.q=0,start.P = 1,start.Q = 0,parallel = TRUE,
+                    stepwise=FALSE,stationary = TRUE)
+
+pred<- forecast(model,h=length(val_data_m))
+
+mae<-mean(abs(pred$mean-coredata(val_data_m))); mae
+
+```
+
+
+
+### search-parametri 
+
+
+```{r}
+
+# Parametri del modello
+p_vals <- c(1, 2, 3)   # Ordini autoregressivi
+q_vals <- c(0, 1)      # Ordini MA
+P_vals <- c(1, 2)      # Ordini stagionali autoregressivi
+Q_vals <- c(0, 1)      # Ordini stagionali
+seasonal_period <- 24  # Periodo stagionale giornaliero
+ 
+# Funzione per creare regressori sinusoidali
+create_sinusoidal_regressors <- function(data_length, period) {
+   t <- 1:data_length
+   sin_reg <- sin(2 * pi * t / period)
+   cos_reg <- cos(2 * pi * t / period)
+   return(cbind(sin_reg, cos_reg))
+ }
+ 
+ # Lunghezza totale (train + test)
+ total_length <- length(train_data_m) + length(val_data_m)
+ 
+ #regressori per l'intero periodo
+sinusoidal_regressors <- create_sinusoidal_regressors(total_length, seasonal_period)
+ 
+#regressori per training e validazione
+sinusoidal_regressors_train <- sinusoidal_regressors[1:length(train_data_m), ]
+ sinusoidal_regressors_val <- sinusoidal_regressors[(length(train_data_m) + 1):total_length, ]
+ 
+# Lista per salvare i risultati
+results <- data.frame(
+  p = integer(), q = integer(), P = integer(), Q = integer(), 
+  MAE_With_Regressors = numeric(), MAE_Without_Regressors = numeric()
+)
+# Ciclo sui parametri
+for (p in p_vals) {
+ for (q in q_vals) {
+    for (P in P_vals) {
+       for (Q in Q_vals) {
+         # Prova con regressori sinusoidali
+         tryCatch({
+           model <- Arima(train_data_m, order = c(p, 0, q), 
+                        seasonal = list(order = c(P, 0, Q), period = seasonal_period), 
+                        xreg = sinusoidal_regressors_train)
+           forecasted <- forecast(model, h = length(val_data_m), xreg = sinusoidal_regressors_val)
+          mae <- mean(abs(forecasted$mean - coredata(val_data_m)), na.rm = TRUE)
+        }, error = function(e) {
+         mae <- 0 # Assegna valore 0 in caso di errore
+        })
+       
+       
+       # Prova senza regressori sinusoidali
+        tryCatch({
+          model_ns <- Arima(train_data_m, order = c(p, 0, q),                              seasonal = list(order = c(P, 0, Q), period = seasonal_period))
+         forecasted_ns <- forecast(model_ns, h = length(val_data_m))         
+         mae_ns <- mean(abs(forecasted_ns$mean - coredata(val_data_m)), na.rm = TRUE)
+         }, error = function(e) {
+           mae_ns <- Inf # Assegna valore Inf in caso di errore
+         })
+         # Salva i risultati con i parametri
+        results <- rbind(results, data.frame(
+          p = p, q = q, P = P, Q = Q, 
+          MAE_With_Regressors = mae, 
+          MAE_Without_Regressors = mae_ns))
+       }
+     }
+   }
+ }
+ 
+# Risultati finali
+results
+```
+
+### Modelli scelti 
+
+
+```{r}
+#modelli scelti 
+
+modello4_ns <- Arima(train_data_m,order= c(1,0,0),seasonal=list(order = c(2, 0, 1), period = 24))
+previsioni <- forecast(modello4_ns,h=length(val_data_m))
+mae4_ns <- mean(abs(previsioni$mean-coredata(val_data_m))); mae4_ns
+# Estrazione dei residui dal modello scelto
+residui <- residuals(modello4_ns) 
+# Plot dei residui 
+plot(residui, main = "Residui del modello", ylab = "Residui", xlab = "Tempo")
+abline(h = 0, col = "red", lwd = 2)
+# ACF dei residui
+Acf(residui, main = "ACF dei residui")
+# Test di Ljung-Box
+ljung_box_test4_ns <- Box.test(residui, type = "Ljung-Box")
+
+
+modello18 <- Arima(train_data_m,order= c(3,0,0),seasonal=list(order = c(1, 0, 1), period = 24),xreg = sinusoidal_regressors_train)
+previsioni <- forecast(modello18,h=length(val_data_m),xreg = sinusoidal_regressors_val)
+mae18 <- mean(abs(previsioni$mean-coredata(val_data_m))); mae18
+residui <- residuals(modello18) 
+# Plot dei residui 
+plot(residui, main = "Residui del modello", ylab = "Residui", xlab = "Tempo")
+abline(h = 0, col = "red", lwd = 2)
+# ACF dei residui
+Acf(residui, main = "ACF dei residui")
+# Test di Ljung-Box
+ljung_box_test_18 <- Box.test(residui, type = "Ljung-Box")
+
+
+```
+
+
+
+
+
+### modello con regressori esterni-festività senza sinusoidi 
+```{r}
+### festività con Prophet
+df <- data.frame(ds = index(train_data_m), y = as.numeric(coredata(train_data_m)))
+m <- prophet()
+m <- add_country_holidays(m, 'US')
+m <- fit.prophet(m, df)
+
+# Previsione
+forecast <- predict(m, h=length(val_data_m))
+
+####Calcolare MAE
+mae_festivita <- mean(abs(forecast$yhat - coredata(val_data_m))); mae_festivita
+
+```
+
+#### Dataset per festività USA
+
+```{r}
+
+start_date <- as.Date("2015-01-01")  
+dates_train <- seq.Date(start_date, by = "day", length.out = length(train_data_m))
+dates_val <- seq.Date(start_date + length(train_data_m), by = "day", length.out = length(val_data_m))
+
+
+# dataframe festività  USA
+holidays <- data.frame(
+  ds = as.Date(c(
+    "2015-01-01", "2015-07-04", "2015-12-25", # Capodanno, Giorno dell'Indipendenza, Natale
+    "2015-11-26", "2015-11-27",              # Giorno del Ringraziamento e Black Friday
+    "2015-02-16", "2015-05-25", "2015-09-07" # Giorno dei Presidenti, Memorial Day, Labor Day
+   
+  )),
+  holiday = c(
+    "New Year", "Independence Day", "Christmas",
+    "Thanksgiving", "Black Friday",
+    "Presidents' Day", "Memorial Day", "Labor Day"
+  )
+)
+
+ 
+years <- seq(2015, 2022) 
+# Duplica le festività per ogni anno e crea un nuovo dataset
+holidays <- holidays %>%
+  mutate(year = year(ds)) %>%
+  filter(year == 2015) %>%
+  bind_rows(
+    lapply(years[-1], function(y) {
+      holidays %>%
+        mutate(ds = as.Date(paste(y, month(ds), day(ds), sep = "-")))
+    }) %>%
+      bind_rows()
+  ) %>%
+  select(-year)
+
+# Creazione dei regressori binari per le festività
+holiday_dates <- as.Date(holidays$ds)
+is_holiday_train <- as.numeric(as.Date(dates_train) %in% holiday_dates)
+is_holiday_val <- as.numeric(as.Date(dates_val) %in% holiday_dates)
+```
+
+
+
+### modello con regressori esterni-festività e sinusoidi 
+
+
+```{r}
+# Calcola le date della serie storica
+start_date <- as.Date("2015-01-01")  
+dates_train <- seq.Date(start_date, by = "day", length.out = length(train_data_m))
+dates_val <- seq.Date(start_date + length(train_data_m), by = "day", length.out = length(val_data_m))
+
+
+holiday_dates <- as.Date(holidays$ds)
+
+# regressori binari per le festività
+is_holiday_train <- as.numeric(dates_train %in% holiday_dates)
+is_holiday_val <- as.numeric(dates_val %in% holiday_dates)
+
+# Modello ARIMA 4 con le festività come regressori
+modello4_holiday <- Arima(
+  train_data_m, 
+  order = c(1, 0, 0), 
+  seasonal = list(order = c(2, 0, 1), period = 24), 
+  xreg = is_holiday_train
+)
+
+# Previsioni
+previsioni4 <- forecast(
+  modello4_holiday, 
+  h = length(val_data_m), 
+  xreg = is_holiday_val
+)
+
+# Calcolo del MAE
+mae4_holiday <- mean(abs(previsioni4$mean - coredata(val_data_m)))
+cat("MAE Modello 4 con Festività:", mae4_holiday, "\n")
+
+residui <- residuals(modello4_holiday) 
+# Plot dei residui
+plot(residui, main = "Residui del modello", ylab = "Residui", xlab = "Tempo")
+abline(h = 0, col = "red", lwd = 2)
+# ACF dei residui
+Acf(residui, main = "ACF dei residui")
+# Test di Ljung-Box
+ljung_box_test4_h <- Box.test(residui, type = "Ljung-Box")
+
+
+
+# Combina regressori sinusoidali e festività
+xreg_train_combined <- cbind(sinusoidal_regressors_train, is_holiday_train)
+xreg_val_combined <- cbind(sinusoidal_regressors_val, is_holiday_val)
+
+# Modello ARIMA 18 con festività
+modello18_holiday <- Arima(
+  train_data_m, 
+  order = c(3, 0, 0), 
+  seasonal = list(order = c(1, 0, 1), period = 24), 
+  xreg = xreg_train_combined
+)
+
+# Previsioni
+previsioni18 <- forecast(
+  modello18_holiday, 
+  h = length(val_data_m), 
+  xreg = xreg_val_combined
+)
+
+# Calcolo del MAE
+mae18_holiday <- mean(abs(previsioni18$mean - coredata(val_data_m)))
+cat("MAE Modello 18 con Festività:", mae18_holiday, "\n")
+
+residui <- residuals(modello18_holiday) 
+# Plot dei residui 
+plot(residui, main = "Residui del modello", ylab = "Residui", xlab = "Tempo")
+abline(h = 0, col = "red", lwd = 2)
+# ACF dei residui
+Acf(residui, main = "ACF dei residui")
+# Test di Ljung-Box
+ljung_box_test_18h <- Box.test(residui, type = "Ljung-Box")
+
+
+```
+
+
+### modello con regressori esterni-festività e sinusoidi periodo 168
+
+
+```{r}
+# regressori sinusoidali per periodo 168 (settimanale)
+sinusoidal_regressors_train <- create_sinusoidal_regressors(length(train_data_m), 168)
+sinusoidal_regressors_val <- create_sinusoidal_regressors(length(val_data_m), 168)
+
+# Combina regressori sinusoidali e festività
+xreg_train_combined <- cbind(sinusoidal_regressors_train, is_holiday_train)
+xreg_val_combined <- cbind(sinusoidal_regressors_val, is_holiday_val)
+
+# Modello ARIMA 4 con festività
+modello4_holiday_2 <- Arima(
+  train_data_m,
+  order = c(1, 0, 0),
+  seasonal = list(order = c(2, 0, 1), period = 24 * 7),  # Periodo settimanale 168
+  xreg = is_holiday_train,
+  method = "CSS"  # Metodo CSS
+)
+
+# Previsioni
+previsioni4 <- forecast(
+  modello4_holiday_2,
+  h = length(val_data_m),
+  xreg = is_holiday_val
+)
+
+# Calcolo del MAE
+mae4_holiday_2 <- mean(abs(previsioni4$mean - coredata(val_data_m)))
+cat("MAE Modello 4 con Festività e Periodo 168:", mae4_holiday_2, "\n")
+
+residui <- residuals(modello4_holiday_2) 
+# Plot dei residui 
+plot(residui, main = "Residui del modello", ylab = "Residui", xlab = "Tempo")
+abline(h = 0, col = "red", lwd = 2)
+# ACF dei residui
+Acf(residui, main = "ACF dei residui")
+# Test di Ljung-Box
+ljung_box_test <- Box.test(residui, type = "Ljung-Box")
+
+# Modello ARIMA 18 con festività
+modello18_holiday_2 <- Arima(
+  train_data_m,
+  order = c(3, 0, 0),
+  seasonal = list(order = c(1, 0, 1), period = 24 * 7),  # Periodo settimanale 168
+  xreg = xreg_train_combined,
+  method = "CSS"  # Metodo CSS
+)
+
+# Previsioni
+previsioni18 <- forecast(
+  modello18_holiday_2,
+  h = length(val_data_m),
+  xreg = xreg_val_combined
+)
+
+# Calcolo del MAE
+mae18_holiday_2 <- mean(abs(previsioni18$mean - coredata(val_data_m)))
+cat("MAE Modello 18 con Festività e Periodo 168:", mae18_holiday_2, "\n")
+
+residui <- residuals(modello18_holiday_2) 
+# Plot dei residui 
+plot(residui, main = "Residui del modello", ylab = "Residui", xlab = "Tempo")
+abline(h = 0, col = "red", lwd = 2)
+# ACF dei residui
+Acf(residui, main = "ACF dei residui")
+# Test di Ljung-Box
+ljung_box_test <- Box.test(residui, type = "Ljung-Box")
+
+```
+
+### Separazione in 24 serie orarie
+
+```{r}
+hourly_series <- split(train_data_m, cycle(train_data_m %% 24))
+
+# Funzione per modellare ogni serie oraria con differenza stagionale
+model_hourly <- function(series, lag = 24) {
+  diff_series <- diff(series, lag = lag)
+  model <- auto.arima(diff_series, d = 0, D = 1, max.P = 2, max.Q = 2, seasonal = TRUE, method = "CSS")
+  return(model)
+}
+
+# Applicazione del modello a tutte le serie
+hourly_models <- lapply(hourly_series, model_hourly)
+
+# Previsione e aggregazione dei risultati
+forecast_hourly <- function(models, val_data) {
+  forecasts <- lapply(models, function(model) forecast(model, h = length(val_data) / 24)$mean)
+  combined_forecast <- do.call(c, forecasts)
+  mae <- mean(abs(combined_forecast - val_data), na.rm = TRUE)
+  return(mae)
+}
+
+mae_hourly <- forecast_hourly(hourly_models, val_data_m)
+cat("MAE Modello ARIMA separato per ore:", mae_hourly, "\n")
+
+```
+
+
+### Stagionalità settimanale
+
+```{r}
+
+library(forecast)
+
+# Funzione per creare 168 sottoserie
+split_into_weekly_subseries <- function(series, period = 168) {
+  matrix(series, ncol = period, byrow = TRUE)
+}
+
+# Modello ARIMA per ciascuna sottoserie
+fit_weekly_arima <- function(train_data, val_data, period = 168) {
+  # Creazione delle sottoserie
+  weekly_subseries <- split_into_weekly_subseries(train_data, period)
+
+  # Lista per modelli e previsioni
+  models <- list()
+  forecasts <- numeric(length(val_data))
+
+  # Itera su ciascuna sottoserie (168 in totale)
+  for (i in 1:period) {
+   
+    current_series <- weekly_subseries[, i, drop = TRUE]
+
+    models[[i]] <- auto.arima(current_series, seasonal = FALSE)
+
+    # Previsione per l'indice corrente
+    forecasts[i:length(forecasts)] <- forecast(models[[i]], h = length(forecasts[i:length(forecasts)]))$mean
+  }
+
+  # modelli e previsioni assemblate
+  list(models = models, forecasts = forecasts)
+}
+
+# Applicazione ai dati di training e validazione
+results <- fit_weekly_arima(train_data_m, val_data_m, period = 168)
+
+# Calcolo MAE
+mae_w <- mean(abs(results$forecasts - val_data_m), na.rm = TRUE)
+
+# Output
+cat("MAE con stagionalità settimanale (168):", mae_w, "\n")
+
+```
+
+
+
+# Modello UCM 
+
+### dummy 24 e trig 168 
+
+```{r}
+# Preparazione del modello
+ytrain <- as.numeric(train_data_m)
+yval <- as.numeric(val_data_m)
+
+
+ucm_mod1 <- SSModel(
+  ytrain ~ SSMtrend(2, list(NA, NA)) +
+    SSMseasonal(24, NA, "dummy") +    # Periodo giornaliero (24 ore)
+    SSMseasonal(168, NA, "trig", harmonics = 1:16), # Periodo settimanale (168 ore)
+  H = NA
+)
+
+# Calcolo della varianza e inizializzazione
+vary <- var(ytrain, na.rm = TRUE)
+ucm_mod1$P1inf <- ucm_mod1$P1inf * 0
+ucm_mod1$a1[1] <- mean(ytrain, na.rm = TRUE)
+diag(ucm_mod1$P1) <- vary
+
+# Parametri iniziali
+init <- numeric(5)
+init[1] <- log(vary / 10)
+init[2] <- log(vary / 10)
+init[3] <- log(vary / 100)
+init[4] <- log(vary / 100)
+init[5] <- log(vary / 10)
+
+# Funzione di aggiornamento
+update_fun <- function(pars, model) {
+  model$Q[1, 1, 1] <- exp(pars[1])
+  model$Q[2, 2, 1] <- exp(pars[2])
+  model$Q[3, 3, 1] <- exp(pars[3])
+  diag(model$Q[4:35, 4:35, 1]) <- exp(pars[4])
+  model$H[1, 1, 1] <- exp(pars[5])
+  model
+}
+
+# Fit del modello
+fit1 <- fitSSM(ucm_mod1, inits = init, 
+               updatefn = update_fun)
+fit1$optim.out$convergence
+
+
+pre1ucm <- predict(fit1$model,n.ahead=length(yval))
+
+
+ucm_mod1_MAEval <- mean(abs(pre1ucm[,1] - yval))
+ucm_mod1_MAEval
+
+
+```
+### Regressori Feste 
+
+Aggiungiamo i regressori per le festività al modello UCM
+
+
+
+```{r}
+ytrain <- as.numeric(train_data_m)
+yval <- as.numeric(val_data_m)
+
+festivita_dummy <-data.frame(is_holiday_val)
+
+
+# Definizione del modello UCM con l'opzione data per feste 
+ucm_mod2 <- SSModel(
+  ytrain ~ SSMtrend(2, list(NA, NA)) +
+    SSMseasonal(24, NA, "dummy") +    # Periodo giornaliero (24 ore)
+    SSMseasonal(168, NA, "trig", harmonics = 1:16),
+  H = NA,
+  data = as.list(festivita_dummy[1:length(ytrain),])
+)
+
+# Inizializzazione dei parametri
+vary <- var(ytrain, na.rm = TRUE)
+ucm_mod2$P1inf <- ucm_mod2$P1inf * 0
+ucm_mod2$a1[1] <- mean(ytrain, na.rm = TRUE)
+diag(ucm_mod2$P1) <- vary
+
+# Valori iniziali delle varianze
+init <- numeric(5)
+init[1] <- log(vary / 10)
+init[2] <- log(vary / 10)
+init[3] <- log(vary / 100)
+init[4] <- log(vary / 100)
+init[5] <- log(vary / 10)
+
+# Funzione di aggiornamento
+update_fun <- function(pars, model) {
+  model$Q[1, 1, 1] <- exp(pars[1])
+  model$Q[2, 2, 1] <- exp(pars[2])
+  model$Q[3, 3, 1] <- exp(pars[3])
+  diag(model$Q[4:35, 4:35, 1]) <- exp(pars[4])
+  model$H[1, 1, 1] <- exp(pars[5])
+  model
+}
+
+# Fitting del modello
+fit2 <- fitSSM(ucm_mod2, inits = init, updatefn = update_fun, control = list(maxit = 1000))
+
+fit2$optim.out$convergence
+
+pre2ucm <- predict(fit2$model, n.ahead = length(yval))
+ucm_mod2_MAEval <- mean(abs(pre2ucm[, 1] - yval))
+ucm_mod2_MAEval
+
+```
+
+
+
+# Machine Learning : KNN 
+
+
+```{r}
+set.seed(2001)
+create_lagged_data <- function(ts_data, max_lag) {
+  lagged_data <- data.frame()
+  for (i in (max_lag + 1):length(ts_data)) {
+    lagged_row <- ts_data[(i - max_lag):(i - 1)]  # Preleva i lag
+    lagged_data <- rbind(lagged_data, lagged_row)
+  }
+  return(lagged_data)
+}
+
+# dati per il training e il test con 3 lag 
+max_lag <- 3  #  3 osservazioni precedenti per la previsione
+
+train_lagged <- create_lagged_data(train_data_m, max_lag)
+val_lagged <- create_lagged_data(val_data_m, max_lag)
+
+# La variabile target sarà la serie temporale stessa, spostata di 1 passo in avanti
+train_target <- train_data_m[(max_lag + 1):length(train_data_m)]
+val_target <- val_data_m[(max_lag + 1):length(val_data_m)]
+
+# la target come ultima colonna ai dati di input
+train_data_lagged <- cbind(train_lagged, target = train_target)
+val_data_lagged <- cbind(val_lagged, target = val_target)
+
+# numero massimo di valori da provare per k
+tuneGrid <- expand.grid(k = 1:10)  # Cerca k da 1 a 10
+train_control <- trainControl(method = "cv", number = 5)  # 5-fold cross-validation
+
+# miglior k con la CV
+knn_tuned <- train(target ~ ., data = train_data_lagged, method = "knn", trControl = train_control, tuneGrid = tuneGrid)
+
+best_k <- knn_tuned$bestTune$k
+print(paste("Il miglior valore di k è:", best_k))
+
+# Modello KNN con il miglior k trovato
+knn_pred <- knn(train = train_data_lagged[, -ncol(train_data_lagged)],  # Variabili predittive (tutte tranne la target)
+                test = val_data_lagged[, -ncol(val_data_lagged)],      # Variabili predittive nel test set
+                cl = train_data_lagged[, ncol(train_data_lagged)],     # Target di addestramento
+                k = best_k)
+
+actual_values <- val_data_lagged[, ncol(val_data_lagged)]  # Target nel test set
+predicted_values <- as.numeric(knn_pred)         # Previsioni del modello KNN
+
+mae_knn <- mean(abs(actual_values - predicted_values))
+print(paste("Mean Absolute Error (MAE):", round(mae_knn, 4)))
+
+```
+
+
+# Grafici 
+
+
+```{r}
+mae_values_vector <- c(mae4_ns, mae18, mae4_holiday,mae4_holiday_2,  mae18_holiday,mae18_holiday_2,mae_festivita, mae_hourly,mae_w,mae_knn)
+
+
+model_names <- c("M4", "M18", "M4+F", "M4 +F_e_Sin","M18+F","M18+F_e_Sin","MF","MH","MW","MKNN")
+barplot(mae_values_vector, names.arg = model_names, col = "skyblue",
+        main = "Confronto MAE tra Modelli", ylab = "MAE")
+
+```
+
+### Grafico Arima
+
+
+```{r}
+
+plot(train_data_m, col = "blue", lwd = 2,
+     ylim = range(c(train_data_m, val_data_m, previsioni4$mean)),
+     main = "Training, Validation e Previsioni",
+     xlab = "Tempo", ylab = "Valori")
+lines(ts(val_data_m, start = end(train_data_m) + c(1, 0), frequency = frequency(train_data_m)),
+      col = "green", lwd = 2) 
+lines(ts(previsioni4$mean, start = end(train_data_m) + c(1, 0), frequency = frequency(train_data_m)),
+      col = "red", lwd = 2, lty = 2) # 
+
+
+legend("topright", legend = c("Training Data", "Validation Data", "Forecasts"),
+       col = c("blue", "green", "red"), lty = c(1, 1, 2), lwd = 2,cex=0.20)
+
+
+
+```
+
+### Grafico UCM 
+
+```{r}
+plot(train_data_m, col = "blue", lwd = 2,
+     ylim = range(c(train_data_m, val_data_m,pre1ucm[,1])),
+     main = "Training, Validation e Previsioni",
+     xlab = "Tempo", ylab = "Valori")
+lines(ts(val_data_m, start = end(train_data_m) + c(1, 0), frequency = frequency(train_data_m)),
+      col = "green", lwd = 2) 
+lines(ts(pre1ucm[,1], start = end(train_data_m) + c(1, 0), frequency = frequency(train_data_m)),
+      col = "red", lwd = 2, lty = 2) 
+
+
+legend("topright", legend = c("Training Data", "Validation Data", "Forecasts"),
+       col = c("blue", "green", "red"), lty = c(1, 1, 2), lwd = 2,cex=0.20)
+
+
+```
+
+
+
+
+
+### Grafico KNN
+
+
+```{r}
+plot(train_data_m, col = "blue", lwd = 2,
+     ylim = range(c(train_data_m, val_data_m, previsioni$mean)),
+     main = "Training, Validation e Previsioni",
+     xlab = "Tempo", ylab = "Valori")
+lines(ts(val_data_m, start = end(train_data_m) + c(1, 0), frequency = frequency(train_data_m)),
+      col = "green", lwd = 2) 
+lines(ts(previsioni$mean, start = end(train_data_m) + c(1, 0), frequency = frequency(train_data_m)),
+      col = "red", lwd = 2, lty = 2) 
+
+
+legend("topright", legend = c("Training Data", "Validation Data", "Forecasts"),
+       col = c("blue", "green", "red"), lty = c(1, 1, 2), lwd = 2,cex=0.20)
+```
+
+
+
+
+
+
+
+## Modelli finali e salvataggio dataset 
+
+Ciascun modello scelto verrà riaddestrato utilizzando l'intero dataset disponibile (train + validation ovvero il train data) per sfruttare al meglio tutte le informazioni storiche. Successivamente, verranno generate e salvate le previsioni per i successivi 744 giorni(l'ultimo mese che corrisponde al test data che abbiamo separato inizialmente), garantendo una stima accurata  tendenze future.
+
+
+```{r}
+#regressori per train data 
+
+start_date <- as.Date("2015-01-01")
+
+dates_train <- seq.Date(start_date, by = "day", length.out = length(train_data))
+dates_test <- seq.Date(start_date + length(train_data), by = "day", length.out = length(test_data))
+
+years <- seq(2015, 2022)
+holidays <- expand.grid(
+  year = years,
+  base_date = as.Date(c(
+    "2015-01-01", "2015-07-04", "2015-12-25", 
+    "2015-11-26", "2015-11-27",
+    "2015-02-16", "2015-05-25", "2015-09-07"
+  ))
+) %>%
+  mutate(ds = as.Date(paste(year, format(base_date, "%m-%d"), sep = "-"))) %>%
+  select(ds)
+
+is_holiday_train <- as.numeric(dates_train %in% holidays$ds)
+is_holiday_test <- as.numeric(dates_test %in% holidays$ds)
+
+print(length(train_data))         
+print(length(is_holiday_train))  
+print(length(test_data))          
+print(length(is_holiday_test))
+
+```
+
+
+
+```{r}
+
+# Modello ARIMA 4 con festività
+modello4_holiday_2_final <- Arima(
+  train_data,
+  order = c(1, 0, 0),
+  seasonal = list(order = c(2, 0, 1), period = 24 * 7), # Periodo settimanale 168
+  method = "CSS",  
+   xreg = is_holiday_train
+)
+
+# Previsioni
+previsioni_arima_final <- forecast(
+  modello4_holiday_2_final,
+  h = length(test_data),
+  xreg = is_holiday_test
+)
+```
+
+```{r}
+ytrain_f <- as.numeric(train_data)
+ucm_mod1_f <- SSModel(
+  ytrain_f ~ SSMtrend(2, list(NA, NA)) +
+    SSMseasonal(24, NA, "dummy") +    # Periodo giornaliero (24 ore)
+    SSMseasonal(168, NA, "trig", harmonics = 1:16), # Periodo settimanale (168 ore)
+  H = NA
+)
+
+# Calcolo della varianza e inizializzazione
+vary <- var(ytrain_f, na.rm = TRUE)
+ucm_mod1_f$P1inf <- ucm_mod1$P1inf * 0
+ucm_mod1_f$a1[1] <- mean(ytrain_f, na.rm = TRUE)
+diag(ucm_mod1_f$P1) <- vary
+
+# Parametri iniziali
+init <- numeric(5)
+init[1] <- log(vary / 10)
+init[2] <- log(vary / 10)
+init[3] <- log(vary / 100)
+init[4] <- log(vary / 100)
+init[5] <- log(vary / 10)
+
+# Funzione di aggiornamento
+update_fun <- function(pars, model) {
+  model$Q[1, 1, 1] <- exp(pars[1])
+  model$Q[2, 2, 1] <- exp(pars[2])
+  model$Q[3, 3, 1] <- exp(pars[3])
+  diag(model$Q[4:35, 4:35, 1]) <- exp(pars[4])
+  model$H[1, 1, 1] <- exp(pars[5])
+  model
+}
+
+# Fit del modello
+fit1_final <- fitSSM(ucm_mod1_f, inits = init, 
+               updatefn = update_fun)
+fit1_final$optim.out$convergence
+
+#Previsioni 
+pre1ucm_final <- predict(fit1_final$model,n.ahead=length(test_data))
+
+
+
+```
+
+
+
+
+
+
+
+```{r}
+set.seed(2001)
+
+# Funzione per creare dati laggati
+create_lagged_data <- function(ts_data, max_lag) {
+  lagged_data <- data.frame()
+  for (i in (max_lag + 1):length(ts_data)) {
+    lagged_row <- ts_data[(i - max_lag):(i - 1)]  # Preleva i lag
+    lagged_data <- rbind(lagged_data, lagged_row)
+  }
+  return(lagged_data)
+}
+
+# Parametro per il lag
+max_lag <- 3  # Usa le 3 osservazioni precedenti per la previsione
+
+# dati laggati per il training
+train_lagged <- create_lagged_data(train_data, max_lag)
+train_target <- train_data[(max_lag + 1):length(train_data)]  # Variabile target
+train_data_lagged <- cbind(train_lagged, target = train_target)  # Dati laggati con target
+
+#miglior k con la validazione incrociata
+tuneGrid <- expand.grid(k = 1:10)  # Prova valori di k da 1 a 10
+train_control <- trainControl(method = "cv", number = 5)  # 5-fold cross-validation
+knn_tuned <- train(
+  target ~ ., 
+  data = train_data_lagged, 
+  method = "knn", 
+  trControl = train_control, 
+  tuneGrid = tuneGrid
+)
+
+# Miglior valore di k trovato
+best_k <- knn_tuned$bestTune$k
+print(paste("Il miglior valore di k è:", best_k))
+
+num_steps <- 744
+future_predictions <- numeric(num_steps)  # Vettore per salvare le previsioni
+current_lagged <- tail(train_data, max_lag)  # Ultimi max_lag valori di train_data
+
+for (i in 1:num_steps) {
+
+  input_data <- as.data.frame(t(current_lagged))
+  colnames(input_data) <- colnames(train_lagged)
+  
+  # previsione usando il modello addestrato
+  prediction <- predict(knn_tuned, newdata = input_data)
+  
+  # Salva la previsione
+  future_predictions[i] <- prediction
+  
+  # Aggiorna i dati laggati per il prossimo step
+  current_lagged <- c(tail(current_lagged, max_lag - 1), prediction)
+}
+
+# Output delle previsioni
+print("Previsioni per i prossimi 744 step:")
+print(future_predictions)
+
+```
+
+
+
+
+
+```{r}
+date_to_dataf<- read.csv("ts2024.csv")
+
+output_data <- data.frame(
+  DateTime = date_to_dataf[16801:17544,1],
+  ARIMA = previsioni_arima_final$mean,
+  UCM = pre1ucm_final,
+  ML = future_predictions
+)
+
+
+
+# Salva il file CSV
+write.csv(output_data,"920172-20250117", row.names = FALSE)
+```
+
